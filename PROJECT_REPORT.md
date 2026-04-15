@@ -7,53 +7,80 @@ This architecture was specifically chosen to bypass the hardware limitations and
 
 ---
 
-## 2. System Components & Hardware Layer
+## 2. Hardware Layer & Data Transmission
 The hardware consists of two separate ESP32 microcontrollers communicating wirelessly over the 2.4GHz ISM band.
 
 ### A. Transmitter ESP32 (The Glove)
 - **Role:** Sensor Acquisition & Data Transmission.
-- **Components:** An analog flex sensor connected to GPIO 36.
-- **Working Mechanism:** 
-  - The Transmitter continuously reads analog voltages representing the physical bend of the glove's flex sensor.
-  - It classifies the raw Analog-to-Digital (ADC) readings into three distinct states:
-    1. **NORMAL** (straight finger)
-    2. **WARNING** (half-bent)
-    3. **HELP NEEDED** (fully bent)
-  - Whenever the state changes, it packages the state into a fixed data struct and instantly broadcasts it to the Receiver ESP32 using the proprietary **ESP-NOW** protocol.
+- **Hardware Config:** An analog flex sensor connected to GPIO 36.
+- **Data Flow & Processing:** 
+  - The Transmitter continuously reads raw analog voltages representing the physical bend of the glove's flex sensor.
+  - **Raw Data Measured:** `val` (0 to 4095 representing ADC voltage on a 11dB attenuation scale).
+  - It classifies the raw ADC reading into distinct numerical states mapping to real-world urgency levels:
+    - `val > 2900` → State 2 (Fully bent)
+    - `val < 2500` → State 0 (Straight)
+    - `between`    → State 1 (Mid-bend)
+- **Data Transmitted (ESP-NOW Payload):**
+  A strict C-struct named `Message` is sent wirelessly over ESP-NOW containing exactly two integers:
+  ```c
+  typedef struct {
+    int state;       // 0=NORMAL, 1=WARNING, 2=HELP NEEDED
+    int relayState;  // 0=OFF, 1=ON (Command for the receiver's relay)
+  } Message;
+  ```
 
 ### B. Receiver ESP32 (The Gateway)
-- **Role:** IoT Gateway, Actuation, & Mobile Server.
-- **Components:** A 16x2 I2C LCD Display and a Relay Module.
+- **Role:** IoT Gateway, Physical Actuation, & Mobile Web Server.
+- **Hardware Config:** A 16x2 I2C LCD Display (SDA: 21, SCL: 22) and an active-low Relay Module (GPIO 23).
 - **Processing Stage:** 
-  - The Receiver acts as an ESP-NOW peer, blindly listening for packets from the Transmitter.
-  - Upon receiving a state change (e.g., `HELP NEEDED`), it triggers local hardware actuations: updating the LCD screen to alert bystanders and switching a physical Relay.
-- **Networking Stage (The WiFi Access Point):**
-  - Crucially, the Receiver isolates the mobile device from the ESP-NOW layer. It stands up its own discrete WiFi network, broadcasting an SSID called **`SmartGlove_AP`** (SoftAP Mode).
-  - It runs a **WebSocket Server** on Port 81.
-  - To prevent radio layer interference across the ESP32's single antenna, the ESP-NOW protocol and the `SmartGlove_AP` WiFi hotspot are strictly locked to **WiFi Channel 1**.
+  - Acts as an ESP-NOW peer, actively listening for the `Message` struct.
+  - Upon receiving the struct, it triggers local physical data actuations: 
+    - **Display Data:** It prints the string equivalent (e.g., `"HELP NEEDED"`) and the relay command (`"Relay: ON"`) to the physical 16x2 LCD screen to alert immediate bystanders.
+    - **Relay Data:** It toggles the GPIO pin HIGH or LOW depending on `incomingData.relayState`.
+- **Data Transmitted (WebSocket Payload):**
+  - The Receiver translates the integer-based C-struct into a human and machine-readable `UTF-8` String payload format.
+  - **Payload Format Supported:** A pipe-delimited string representing `"STATUS|RELAY"`.
+  - **Exact Data Variations Broadcasted via WebSocket:**
+    - `"NORMAL|OFF"`
+    - `"WARNING|OFF"`
+    - `"HELP NEEDED|ON"`
 
 ---
 
-## 3. The Software & Mobile Application Layer (Flutter)
-The mobile application acts as the digital dashboard for end-users, caregivers, or operators. It is built using the Flutter framework natively compiled for smartphones.
+## 3. The Software Layer (Flutter Mobile App)
+The mobile application acts as the digital dashboard for end-users, caregivers, or operators. It connects instantly to the Receiver's dedicated WiFi hotspot (`SmartGlove_AP`).
 
-### A. Connectivity Protocol (WebSockets)
-Instead of relying on fragile native Bluetooth scanning (which requires GPS location permissions and suffers from GATT caching bugs across Android updates), the mobile phone connects directly to the `SmartGlove_AP` WiFi network.
-- The Flutter application utilizes the lightweight, full-duplex `web_socket_channel` library to establish a permanent TCP socket connection to the Receiver ESP32's static IP (`ws://192.168.4.1:81`).
+### A. Connectivity Protocol
+- The Flutter application establishes a permanent, full-duplex TCP socket connection to the Receiver ESP32's static IP via WebSockets (`ws://192.168.4.1:81`).
 
-### B. Data Parsing & State Management
-- Data is transmitted over the WebSocket as simple, pipe-delimited UTF-8 strings (e.g., `"HELP NEEDED|ON"`).
-- A unified State Notifier (`GloveNotifier`) inside the Flutter application instantly parses this raw string into structured Dart Enum objects (`GloveData`).
-- The entire mobile UI reacts synchronously: updating visual cards (Green/Orange/Red metrics), calculating timestamp metrics, and updating the connection status indicator at the top right of the dashboard.
+### B. Mobile Data Parsing & Structural Typing
+When the mobile app receives the plain text payload (e.g., `"HELP NEEDED|ON"`), it is intercepted by `WsManager` and fed into a custom parser (`GloveData.fromRaw()`). 
 
-### C. Voice Alerts (TTS Integration)
-- For accessibility, the mobile application incorporates an invisible `TtsService` (Text-to-Speech).
-- Depending on the structured `GloveData` received via WebSocket, the phone will autonomously speak alerts out loud (e.g., dynamically adjusting volume and stating *"Help needed"* or *"System Normal"*).
+- **Data Types Generated:** The parser converts the raw strings into strongly-typed Dart Enums to prevent UI errors.
+  1. `GloveStatus`: Contains mappings for `helpNeeded`, `warning`, `normal`, and `unknown`.
+  2. `RelayStatus`: Contains mappings for `on`, `off`, and `unknown`.
+  3. `DateTime`: Automatically tags the incoming data with the exact millisecond timestamp it arrived.
+
+### C. Data Representation in the UI
+The received data controls all aspects of the `dashboard_screen.dart` user interface:
+- **Connection Data:** A top-right indicator shows instantaneous `Connected` (Green), `Connecting` (Orange), or `Disconnected` (Grey) states based on WebSocket pinging.
+- **Metric Data:** Massive color-coded cards dynamically shift logic based on `GloveStatus`:
+  - **Green Card:** System Normal
+  - **Yellow Card:** Warning Alert
+  - **Red Card:** Help Needed Alert
+- **Timestamp Data:** Calculates and lists exactly how long ago the last data packet successfully arrived (e.g., "Just now" vs "5m ago").
+
+### D. Voice Alert Data (TTS Integration)
+- The structured `GloveStatus` data object is passed into the `TtsService`.
+- Depending on the severity of the data, the phone acts autonomously:
+  - **Help Needed:** Sets phone volume to 100% (1.0) and audibly states *"Help needed"*.
+  - **Warning:** Sets volume to 80% (0.8) and states *"Warning alert"*.
+  - **Normal:** Sets volume to 50% (0.5) and states *"Normal"*.
 
 ---
 
-## 4. Conclusion & Advantages of this Architecture
-By migrating from Bluetooth to a **WiFi Access Point + WebSocket** topology:
-1. **Zero Interference:** ESP-NOW and standard WiFi native to the ESP32 share the same fundamental 802.11 physical layer. Locking them both to Channel 1 completely solves dropped packets.
-2. **Platform Agnostic:** WebSockets over local WiFi require exactly zero specialized permissions on modern Android and iOS devices, unlike BLE.
-3. **Impeccable Latency:** WebSocket connections remain persistently open, allowing the Gateway ESP32 to push critical `"HELP NEEDED"` alerts to the phone in low single-digit milliseconds. 
+## 4. Conclusion & Advantages of this Open Architecture
+By utilizing this structured data-pipe from **Analog Voltage** → **Integer C-Struct** → **Pipe-Delimited String** → **Typed Dart Objects**:
+1. **Zero Interference:** ESP-NOW and standard WiFi native to the ESP32 share the same fundamental 802.11 physical layer, locking both to Channel 1 completely solves dropped packets.
+2. **Platform & Data Agnostic:** WebSockets passing simple delimited UTF-8 text guarantees any operating system (Android, iOS, Windows, macOS) can flawlessly ingest the data.
+3. **Impeccable Reliability:** The exact state of the flex-sensor reaches the mobile device's UI text-to-speech engine in single-digit milliseconds.
