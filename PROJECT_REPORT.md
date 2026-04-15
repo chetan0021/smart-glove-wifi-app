@@ -5,6 +5,30 @@ The SmartGlove project is an IoT-based assistive technology system designed to c
 
 This architecture was specifically chosen to bypass the hardware limitations and connection bottlenecks often found when running Bluetooth Low Energy (BLE) and WiFi on the same radio antenna.
 
+## System Architecture Diagram
+
+```mermaid
+flowchart LR
+    A["Transmitter ESP32\n(The Glove)\nReads GPIO 36"] -- "Message Struct\nESP-NOW (Channel 1)" --> B["Receiver ESP32\n(The Gateway)\nStatic IP: 192.168.4.1"]
+    
+    subgraph Hardware Layer
+    A
+    B
+    end
+
+    B -- "I2C" --> D["LCD Display\n(16x2)"]
+    B -- "GPIO 23" --> E["Relay Module\n(Active Low)"]
+
+    B -- "UTF-8 String via\nWebSockets (Port 81)" --> C["Flutter Mobile App\n(SmartGlove_AP WiFi)"]
+
+    subgraph Software Layer
+    C
+    end
+
+    C -. "Parses String\nto GloveData" .-> F["Voice Alarms\n(TTS Engine)"]
+    C -. "Parses String\nto GloveData" .-> G["Dynamic Dashboard\n(UI Rendering)"]
+```
+
 ---
 
 ## 2. Hardware Layer & Data Transmission
